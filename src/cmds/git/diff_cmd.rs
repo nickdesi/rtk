@@ -140,11 +140,44 @@ fn compute_diff(lines1: &[&str], lines2: &[&str]) -> DiffResult {
 }
 
 fn similarity(a: &str, b: &str) -> f64 {
+    if a.is_ascii() && b.is_ascii() {
+        return ascii_similarity(a.as_bytes(), b.as_bytes());
+    }
+
     let a_chars: std::collections::HashSet<char> = a.chars().collect();
     let b_chars: std::collections::HashSet<char> = b.chars().collect();
 
     let intersection = a_chars.intersection(&b_chars).count();
     let union = a_chars.union(&b_chars).count();
+
+    if union == 0 {
+        1.0
+    } else {
+        intersection as f64 / union as f64
+    }
+}
+
+fn ascii_similarity(a: &[u8], b: &[u8]) -> f64 {
+    let mut seen_a = [false; 128];
+    let mut seen_b = [false; 128];
+
+    for &byte in a {
+        seen_a[byte as usize] = true;
+    }
+    for &byte in b {
+        seen_b[byte as usize] = true;
+    }
+
+    let mut intersection = 0;
+    let mut union = 0;
+    for i in 0..seen_a.len() {
+        if seen_a[i] || seen_b[i] {
+            union += 1;
+            if seen_a[i] && seen_b[i] {
+                intersection += 1;
+            }
+        }
+    }
 
     if union == 0 {
         1.0
