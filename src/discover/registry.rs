@@ -57,7 +57,7 @@ lazy_static! {
         let unquoted = r#"[^\s]*"#;
         let env_value = format!("(?:{}|{}|{})", double_quoted, single_quoted, unquoted);
         let env_assign = format!(r#"[A-Z_][A-Z0-9_]*={}"#, env_value);
-        Regex::new(&format!(r#"^(?:sudo\s+|env\s+|{}\s+)+"#, env_assign)).unwrap()
+        Regex::new(&format!(r#"^(?:sudo\s+|env\s+|{}\s+)"#, env_assign)).unwrap()
     };
     // Git global options that appear before the subcommand: -C <path>, -c <key=val>,
     // --git-dir <dir>, --work-tree <dir>, and flag-only options (#163)
