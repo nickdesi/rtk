@@ -353,6 +353,80 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
     }
 }
 
+/// Auto-detect agent format from stdin and dispatch to the right hook handler.
+///
+/// Detection rules (in order):
+/// 1. `toolName` (camelCase) → Copilot CLI (deny-with-suggestion)
+/// 2. `tool_name` = "run_shell_command" → Gemini CLI (allow/deny)
+/// 3. Everything else (`Bash`, `runTerminalCommand`, unknown) → Claude Code format
+///    (VS Code Copilot Chat also accepts `updatedInput`, so this covers both)
+pub fn run_auto() -> Result<()> {
+    let input = read_stdin_limited()?;
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(());
+    }
+
+    let v: Value = match serde_json::from_str(input) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "[rtk hook] Failed to parse JSON: {e}");
+            return Ok(());
+        }
+    };
+
+    // 1. Copilot CLI: camelCase toolName/toolArgs
+    if v.get("toolName").is_some() {
+        return match detect_format(&v) {
+            HookFormat::CopilotCli { command } => handle_copilot_cli(&command),
+            _ => Ok(()),
+        };
+    }
+
+    // 2. Gemini CLI: tool_name = "run_shell_command"
+    if v.get("tool_name").and_then(|t| t.as_str()) == Some("run_shell_command") {
+        let cmd = v
+            .pointer("/tool_input/command")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        if cmd.is_empty() {
+            print_allow();
+            return Ok(());
+        }
+        if permissions::check_command(cmd) == PermissionVerdict::Deny {
+            let _ = writeln!(
+                io::stdout(),
+                r#"{{"decision":"deny","reason":"Blocked by RTK permission rule"}}"#
+            );
+            return Ok(());
+        }
+        let excluded = crate::core::config::Config::load()
+            .map(|c| c.hooks.exclude_commands)
+            .unwrap_or_default();
+        match rewrite_command(cmd, &excluded) {
+            Some(ref rewritten) => {
+                audit_log("rewrite", cmd, rewritten);
+                print_rewrite(rewritten);
+            }
+            None => print_allow(),
+        }
+        return Ok(());
+    }
+
+    // 3. Everything else → Claude Code format (also accepted by VS Code Copilot Chat)
+    match process_claude_payload(&v) {
+        PayloadAction::Rewrite { cmd, rewritten, output } => {
+            audit_log("rewrite", &cmd, &rewritten);
+            let _ = writeln!(io::stdout(), "{output}");
+        }
+        PayloadAction::Skip { reason, cmd } => {
+            audit_log(reason, &cmd, "");
+        }
+        PayloadAction::Ignore => {}
+    }
+    Ok(())
+}
+
 /// Run the Claude Code PreToolUse hook natively.
 pub fn run_claude() -> Result<()> {
     let input = read_stdin_limited()?;
