@@ -376,6 +376,7 @@ fn run_aws_filtered(
     Ok(0)
 }
 
+#[allow(dead_code)]
 fn run_sts_identity(extra_args: &[String], verbose: u8) -> Result<i32> {
     run_aws_filtered(
         &["sts", "get-caller-identity"],
