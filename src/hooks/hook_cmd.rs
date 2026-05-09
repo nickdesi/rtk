@@ -3,13 +3,13 @@
 //! Uses `writeln!(stdout, ...)` instead of `println!` — accidental stdout/stderr
 //! corrupts the JSON protocol (Claude Code bug #4669 silently disables the hook).
 
-use super::constants::PRE_TOOL_USE_KEY;
 use super::permissions::{self, PermissionVerdict};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::io::{self, Read, Write};
 
 use crate::discover::registry::{has_heredoc, rewrite_command};
+use crate::hooks::constants::PRE_TOOL_USE_KEY;
 
 const STDIN_CAP: usize = 1_048_576; // 1 MiB
 
@@ -107,11 +107,7 @@ fn get_rewritten(cmd: &str) -> Option<String> {
         return None;
     }
 
-    let (excluded, transparent_prefixes) = crate::core::config::Config::load()
-        .map(|c| (c.hooks.exclude_commands, c.hooks.transparent_prefixes))
-        .unwrap_or_default();
-
-    let rewritten = rewrite_command(cmd, &excluded, &transparent_prefixes)?;
+    let rewritten = rewrite_command(cmd, &[], &[])?;
 
     if rewritten == cmd {
         return None;
@@ -210,12 +206,7 @@ pub fn run_gemini() -> Result<()> {
         );
         return Ok(());
     }
-
-    let (excluded, transparent_prefixes) = crate::core::config::Config::load()
-        .map(|c| (c.hooks.exclude_commands, c.hooks.transparent_prefixes))
-        .unwrap_or_default();
-
-    match rewrite_command(cmd, &excluded, &transparent_prefixes) {
+    match get_rewritten(cmd) {
         Some(ref rewritten) => {
             audit_log("rewrite", cmd, rewritten);
             print_rewrite(rewritten);
@@ -400,10 +391,7 @@ pub fn run_auto() -> Result<()> {
             );
             return Ok(());
         }
-        let excluded = crate::core::config::Config::load()
-            .map(|c| c.hooks.exclude_commands)
-            .unwrap_or_default();
-        match rewrite_command(cmd, &excluded) {
+        match get_rewritten(cmd) {
             Some(ref rewritten) => {
                 audit_log("rewrite", cmd, rewritten);
                 print_rewrite(rewritten);
@@ -415,7 +403,11 @@ pub fn run_auto() -> Result<()> {
 
     // 3. Everything else → Claude Code format (also accepted by VS Code Copilot Chat)
     match process_claude_payload(&v) {
-        PayloadAction::Rewrite { cmd, rewritten, output } => {
+        PayloadAction::Rewrite {
+            cmd,
+            rewritten,
+            output,
+        } => {
             audit_log("rewrite", &cmd, &rewritten);
             let _ = writeln!(io::stdout(), "{output}");
         }
