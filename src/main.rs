@@ -751,6 +751,8 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum HookCommands {
+    /// Auto-detect agent format and process accordingly (Claude Code, VS Code Copilot, Gemini, Copilot CLI)
+    Auto,
     /// Process Claude Code PreToolUse hook (reads JSON from stdin)
     Claude,
     /// Process Cursor Agent hook (reads JSON from stdin)
@@ -2098,6 +2100,10 @@ fn run_cli() -> Result<i32> {
         }
 
         Commands::Hook { command } => match command {
+            HookCommands::Auto => {
+                hooks::hook_cmd::run_auto()?;
+                0
+            }
             HookCommands::Claude => {
                 hooks::hook_cmd::run_claude()?;
                 0
