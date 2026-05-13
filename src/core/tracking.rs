@@ -43,7 +43,6 @@ use std::time::Instant;
 fn current_project_path_string() -> String {
     std::env::current_dir()
         .ok()
-        .and_then(|p| p.canonicalize().ok())
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default()
 }
@@ -92,6 +91,8 @@ pub struct Tracker {
     conn: Connection,
 }
 
+const SCHEMA_VERSION: i64 = 1;
+
 /// Individual command record from tracking history.
 ///
 /// Contains timestamp, command name, and savings metrics for a single execution.
@@ -115,6 +116,12 @@ pub struct CommandRecord {
 pub struct GainSummary {
     /// Total number of commands recorded
     pub total_commands: usize,
+    /// Commands that went through a filter path (including zero-savings fallbacks)
+    pub filtered_commands: usize,
+    /// Commands recorded as passthrough (0 input / 0 output)
+    pub passthrough_commands: usize,
+    /// Filtered commands that produced no savings
+    pub zero_savings_commands: usize,
     /// Total input tokens across all commands
     pub total_input: usize,
     /// Total output tokens across all commands
@@ -253,13 +260,35 @@ impl Tracker {
         }
 
         let conn = Connection::open(&db_path)?;
-        // WAL mode + busy_timeout for concurrent access (multiple Claude Code instances).
-        // Non-fatal: NFS/read-only filesystems may not support WAL.
-        let _ = conn.execute_batch(
+        let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+        let tracker = Self { conn };
+
+        let schema_version: i64 = tracker
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0);
+        if schema_version != SCHEMA_VERSION {
+            tracker.init_schema()?;
+        }
+
+        Ok(tracker)
+    }
+
+    /// Create an isolated in-memory tracker for tests.
+    #[cfg(test)]
+    pub fn new_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory().context("Failed to open in-memory DB")?;
+        let tracker = Self { conn };
+        tracker.init_schema()?;
+        Ok(tracker)
+    }
+
+    fn init_schema(&self) -> Result<()> {
+        let _ = self.conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA busy_timeout=5000;",
         );
-        conn.execute(
+        self.conn.execute(
             "CREATE TABLE IF NOT EXISTS commands (
                 id INTEGER PRIMARY KEY,
                 timestamp TEXT NOT NULL,
@@ -272,24 +301,21 @@ impl Tracker {
             )",
             [],
         )?;
-
-        conn.execute(
+        self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_timestamp ON commands(timestamp)",
             [],
         )?;
 
-        // Migration: add exec_time_ms column if it doesn't exist
-        let _ = conn.execute(
+        let _ = self.conn.execute(
             "ALTER TABLE commands ADD COLUMN exec_time_ms INTEGER DEFAULT 0",
             [],
         );
-        // Migration: add project_path column with DEFAULT '' for new rows // changed: added DEFAULT
-        let _ = conn.execute(
+        let _ = self.conn.execute(
             "ALTER TABLE commands ADD COLUMN project_path TEXT DEFAULT ''",
             [],
         );
-        // One-time migration: normalize NULLs from pre-default schema // changed: guarded with EXISTS
-        let has_nulls: bool = conn
+        let has_nulls: bool = self
+            .conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM commands WHERE project_path IS NULL)",
                 [],
@@ -297,69 +323,16 @@ impl Tracker {
             )
             .unwrap_or(false);
         if has_nulls {
-            let _ = conn.execute(
+            let _ = self.conn.execute(
                 "UPDATE commands SET project_path = '' WHERE project_path IS NULL",
                 [],
             );
         }
-        // Index for fast project-scoped gain queries // added
-        let _ = conn.execute(
+        let _ = self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_project_path_timestamp ON commands(project_path, timestamp)",
             [],
         );
 
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS parse_failures (
-                id INTEGER PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                raw_command TEXT NOT NULL,
-                error_message TEXT NOT NULL,
-                fallback_succeeded INTEGER NOT NULL DEFAULT 0
-            )",
-            [],
-        )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_pf_timestamp ON parse_failures(timestamp)",
-            [],
-        )?;
-
-        Ok(Self { conn })
-    }
-
-    /// Create an isolated in-memory tracker for tests.
-    #[cfg(test)]
-    pub fn new_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory().context("Failed to open in-memory DB")?;
-        let tracker = Self { conn };
-        tracker.init_schema()?;
-        Ok(tracker)
-    }
-
-    #[cfg(test)]
-    fn init_schema(&self) -> Result<()> {
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS commands (
-                id INTEGER PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                original_cmd TEXT NOT NULL,
-                rtk_cmd TEXT NOT NULL,
-                input_tokens INTEGER NOT NULL,
-                output_tokens INTEGER NOT NULL,
-                saved_tokens INTEGER NOT NULL,
-                savings_pct REAL NOT NULL,
-                exec_time_ms INTEGER DEFAULT 0,
-                project_path TEXT DEFAULT ''
-            )",
-            [],
-        )?;
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_timestamp ON commands(timestamp)",
-            [],
-        )?;
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_project_path_timestamp ON commands(project_path, timestamp)",
-            [],
-        )?;
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS parse_failures (
                 id INTEGER PRIMARY KEY,
@@ -374,6 +347,8 @@ impl Tracker {
             "CREATE INDEX IF NOT EXISTS idx_pf_timestamp ON parse_failures(timestamp)",
             [],
         )?;
+        self.conn
+            .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -572,6 +547,9 @@ impl Tracker {
     pub fn get_summary_filtered(&self, project_path: Option<&str>) -> Result<GainSummary> {
         let (project_exact, project_glob) = project_filter_params(project_path); // added
         let mut total_commands = 0usize;
+        let mut filtered_commands = 0usize;
+        let mut passthrough_commands = 0usize;
+        let mut zero_savings_commands = 0usize;
         let mut total_input = 0usize;
         let mut total_output = 0usize;
         let mut total_saved = 0usize;
@@ -596,6 +574,14 @@ impl Tracker {
         for row in rows {
             let (input, output, saved, time_ms) = row?;
             total_commands += 1;
+            if input == 0 && output == 0 {
+                passthrough_commands += 1;
+            } else {
+                filtered_commands += 1;
+                if saved == 0 {
+                    zero_savings_commands += 1;
+                }
+            }
             total_input += input;
             total_output += output;
             total_saved += saved;
@@ -619,6 +605,9 @@ impl Tracker {
 
         Ok(GainSummary {
             total_commands,
+            filtered_commands,
+            passthrough_commands,
+            zero_savings_commands,
             total_input,
             total_output,
             total_saved,
@@ -1282,8 +1271,8 @@ pub fn record_parse_failure_silent(raw_command: &str, error_message: &str, succe
 /// assert_eq!(estimate_tokens("hello world"), 3); // 11 chars = ceil(2.75) = 3
 /// ```
 pub fn estimate_tokens(text: &str) -> usize {
-    // ~4 chars per token on average
-    (text.len() as f64 / 4.0).ceil() as usize
+    // ~4 chars per token on average, rounded up.
+    text.len().div_ceil(4)
 }
 
 /// Helper struct for timing command execution
@@ -1685,5 +1674,45 @@ mod tests {
             failures.total, 0,
             "parse_failures table should be empty after reset"
         );
+    }
+
+    #[test]
+    fn test_summary_tracks_filtered_vs_passthrough_coverage() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create in-memory tracker");
+        let pid = std::process::id();
+
+        tracker
+            .record(
+                "git diff",
+                &format!("rtk git diff coverage_test_{}", pid),
+                100,
+                20,
+                10,
+            )
+            .expect("Failed to record filtered command");
+        tracker
+            .record(
+                "gh pr view",
+                &format!("rtk gh pr view coverage_test_{}", pid),
+                50,
+                50,
+                5,
+            )
+            .expect("Failed to record zero-savings command");
+        tracker
+            .record(
+                "gh api",
+                &format!("rtk gh api passthrough_test_{}", pid),
+                0,
+                0,
+                2,
+            )
+            .expect("Failed to record passthrough command");
+
+        let summary = tracker.get_summary().expect("Failed to get summary");
+        assert_eq!(summary.total_commands, 3);
+        assert_eq!(summary.filtered_commands, 2);
+        assert_eq!(summary.passthrough_commands, 1);
+        assert_eq!(summary.zero_savings_commands, 1);
     }
 }

@@ -63,7 +63,7 @@ struct Cli {
     verbose: u8,
 
     /// Ultra-compact mode: ASCII icons, inline format (Level 2 optimizations)
-    #[arg(long, global = true)]
+    #[arg(short = 'u', long)]
     ultra_compact: bool,
 
     /// Set SKIP_ENV_VALIDATION=1 for child processes (Next.js, tsc, lint, prisma)
@@ -889,6 +889,12 @@ enum PnpmCommands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Run build script (passthrough to `pnpm run build`)
+    Build {
+        /// Additional build arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Typecheck (delegates to tsc filter)
     Typecheck {
         /// Additional typecheck arguments
@@ -1320,10 +1326,11 @@ fn merge_pnpm_args_os(filters: &[String], args: &[OsString]) -> Vec<OsString> {
 fn validate_pnpm_filters(filters: &[String], command: &PnpmCommands) -> Option<String> {
     // Check if this is a Build or Typecheck command with filters
     match command {
-        PnpmCommands::Typecheck { .. } => {
+        PnpmCommands::Build { .. } | PnpmCommands::Typecheck { .. } => {
             // FIXME: if filters are present, we should find out which workspaces are selected before running rtk dedicated commands
             if !filters.is_empty() {
                 let cmd_name = match command {
+                    PnpmCommands::Build { .. } => "build",
                     PnpmCommands::Typecheck { .. } => "tsc",
                     _ => unreachable!(),
                 };
@@ -1333,10 +1340,10 @@ fn validate_pnpm_filters(filters: &[String], command: &PnpmCommands) -> Option<S
                 );
                 return Some(msg);
             }
-            None
         }
-        _ => None,
+        _ => {}
     }
+    None
 }
 
 fn main() {
@@ -1603,6 +1610,11 @@ fn run_cli() -> Result<i32> {
                     &merge_pnpm_args(&filter, &args),
                     cli.verbose,
                 )?,
+                PnpmCommands::Build { args } => {
+                    let mut build_args = vec!["run".to_string(), "build".to_string()];
+                    build_args.extend(args);
+                    npm_cmd::run_filtered("pnpm", &build_args, cli.verbose, cli.skip_env)?
+                }
                 PnpmCommands::Typecheck { args } => tsc_cmd::run(&args, cli.verbose)?,
                 PnpmCommands::Other(args) => {
                     pnpm_cmd::run_passthrough(&merge_pnpm_args_os(&filter, &args), cli.verbose)?
@@ -1775,19 +1787,20 @@ fn run_cli() -> Result<i32> {
                 verbose: cli.verbose,
                 dry_run,
             };
+            let patch_mode = if auto_patch {
+                hooks::init::PatchMode::Auto
+            } else if no_patch {
+                hooks::init::PatchMode::Skip
+            } else {
+                hooks::init::PatchMode::Ask
+            };
+
             if show {
                 hooks::init::show_config(codex)?;
             } else if uninstall {
                 let cursor = agent == Some(AgentTarget::Cursor);
                 hooks::init::uninstall(global, gemini, codex, cursor, ctx)?;
             } else if gemini {
-                let patch_mode = if auto_patch {
-                    hooks::init::PatchMode::Auto
-                } else if no_patch {
-                    hooks::init::PatchMode::Skip
-                } else {
-                    hooks::init::PatchMode::Ask
-                };
                 hooks::init::run_gemini(global, hook_only, patch_mode, ctx)?;
             } else if copilot {
                 hooks::init::run_copilot(ctx)?;
@@ -1803,6 +1816,11 @@ fn run_cli() -> Result<i32> {
                     );
                 }
                 hooks::init::run_antigravity_mode(ctx)?;
+            } else if !opencode && agent.is_none() && !codex {
+                hooks::init::run(
+                    global, true, false, false, false, false, claude_md, hook_only, false,
+                    patch_mode, ctx,
+                )?;
             } else {
                 let install_opencode = opencode;
                 let install_claude = !opencode;
@@ -1810,13 +1828,6 @@ fn run_cli() -> Result<i32> {
                 let install_windsurf = agent == Some(AgentTarget::Windsurf);
                 let install_cline = agent == Some(AgentTarget::Cline);
 
-                let patch_mode = if auto_patch {
-                    hooks::init::PatchMode::Auto
-                } else if no_patch {
-                    hooks::init::PatchMode::Skip
-                } else {
-                    hooks::init::PatchMode::Ask
-                };
                 hooks::init::run(
                     global,
                     install_claude,
@@ -3039,6 +3050,27 @@ mod tests {
             cli.ultra_compact,
             "--ultra-compact long form must still enable ultra-compact mode"
         );
+    }
+
+    #[test]
+    fn test_ultra_compact_short_form_works() {
+        let cli = Cli::try_parse_from(["rtk", "-u", "git", "status"]).unwrap();
+        assert!(
+            cli.ultra_compact,
+            "-u short form must enable ultra-compact mode when used before the command"
+        );
+    }
+
+    #[test]
+    fn test_pnpm_build_parses_as_supported_command() {
+        let cli = Cli::try_parse_from(["rtk", "pnpm", "build", "--filter", "@app"]).unwrap();
+        match cli.command {
+            Commands::Pnpm {
+                command: PnpmCommands::Build { args },
+                ..
+            } => assert_eq!(args, vec!["--filter", "@app"]),
+            _ => panic!("Expected Pnpm Build command"),
+        }
     }
 
     #[test]

@@ -355,6 +355,13 @@ fn is_blob_show_arg(arg: &str) -> bool {
 }
 
 pub(crate) fn compact_diff(diff: &str, max_lines: usize) -> String {
+    fn push_context_summary(result: &mut Vec<String>, context_lines: &mut usize) {
+        if *context_lines > 0 {
+            result.push(format!("  ... ({} context lines)", *context_lines));
+            *context_lines = 0;
+        }
+    }
+
     let mut result = Vec::new();
     let mut current_file = String::new();
     let mut added = 0;
@@ -362,18 +369,25 @@ pub(crate) fn compact_diff(diff: &str, max_lines: usize) -> String {
     let mut in_hunk = false;
     let mut hunk_shown = 0;
     let mut hunk_skipped = 0usize;
-    let max_hunk_lines = 50;
+    let mut context_lines = 0usize;
+    let max_hunk_lines = 40;
     let mut was_truncated = false;
+    let small_change_threshold = 4;
 
     for line in diff.lines() {
         if line.starts_with("diff --git") {
             // Flush hunk truncation before starting a new file
+            push_context_summary(&mut result, &mut context_lines);
             if hunk_skipped > 0 {
                 result.push(format!("  ... ({} lines truncated)", hunk_skipped));
                 was_truncated = true;
                 hunk_skipped = 0;
             }
             if !current_file.is_empty() && (added > 0 || removed > 0) {
+                let total_changes = added + removed;
+                if total_changes <= small_change_threshold {
+                    result.push(format!("  summary: {} small changes", total_changes));
+                }
                 result.push(format!("  +{} -{}", added, removed));
             }
             current_file = line.split(" b/").nth(1).unwrap_or("unknown").to_string();
@@ -382,8 +396,10 @@ pub(crate) fn compact_diff(diff: &str, max_lines: usize) -> String {
             removed = 0;
             in_hunk = false;
             hunk_shown = 0;
+            context_lines = 0;
         } else if line.starts_with("@@") {
             // Flush hunk truncation before starting a new hunk
+            push_context_summary(&mut result, &mut context_lines);
             if hunk_skipped > 0 {
                 result.push(format!("  ... ({} lines truncated)", hunk_skipped));
                 was_truncated = true;
@@ -396,6 +412,7 @@ pub(crate) fn compact_diff(diff: &str, max_lines: usize) -> String {
             result.push(format!("  {}", line));
         } else if in_hunk {
             if line.starts_with('+') && !line.starts_with("+++") {
+                push_context_summary(&mut result, &mut context_lines);
                 added += 1;
                 if hunk_shown < max_hunk_lines {
                     result.push(format!("  {}", line));
@@ -404,6 +421,7 @@ pub(crate) fn compact_diff(diff: &str, max_lines: usize) -> String {
                     hunk_skipped += 1;
                 }
             } else if line.starts_with('-') && !line.starts_with("---") {
+                push_context_summary(&mut result, &mut context_lines);
                 removed += 1;
                 if hunk_shown < max_hunk_lines {
                     result.push(format!("  {}", line));
@@ -414,7 +432,7 @@ pub(crate) fn compact_diff(diff: &str, max_lines: usize) -> String {
             } else if hunk_shown < max_hunk_lines && !line.starts_with("\\") {
                 // Context line
                 if hunk_shown > 0 {
-                    result.push(format!("  {}", line));
+                    context_lines += 1;
                     hunk_shown += 1;
                 }
             }
@@ -428,12 +446,17 @@ pub(crate) fn compact_diff(diff: &str, max_lines: usize) -> String {
     }
 
     // Flush last hunk
+    push_context_summary(&mut result, &mut context_lines);
     if hunk_skipped > 0 {
         result.push(format!("  ... ({} lines truncated)", hunk_skipped));
         was_truncated = true;
     }
 
     if !current_file.is_empty() && (added > 0 || removed > 0) {
+        let total_changes = added + removed;
+        if total_changes <= small_change_threshold {
+            result.push(format!("  summary: {} small changes", total_changes));
+        }
         result.push(format!("  +{} -{}", added, removed));
     }
 
@@ -936,8 +959,7 @@ fn compact_short_status(output: &str) -> Option<String> {
             _ => {
                 if status.as_bytes()[0] != b' ' {
                     staged.push(path);
-                }
-                if status.as_bytes()[1] != b' ' {
+                } else if status.as_bytes()[1] != b' ' {
                     modified.push(path);
                 }
             }
@@ -1991,6 +2013,50 @@ mod tests {
     }
 
     #[test]
+    fn test_compact_diff_summarizes_context_runs() {
+        let diff = r#"diff --git a/foo.rs b/foo.rs
+--- a/foo.rs
++++ b/foo.rs
+@@ -10,6 +10,7 @@ fn important_context() {
+ line 1
+ line 2
+ line 3
++added line
+ line 4
+ line 5
+}"#;
+        let result = compact_diff(diff, 100);
+        assert!(
+            result.contains("... (3 context lines)"),
+            "Expected grouped leading context lines, got:\n{}",
+            result
+        );
+        assert!(result.contains("+added line"));
+        assert!(result.contains("... (3 context lines)"));
+    }
+
+    #[test]
+    fn test_compact_diff_summarizes_small_file_changes() {
+        let diff = r#"diff --git a/foo.rs b/foo.rs
+--- a/foo.rs
++++ b/foo.rs
+@@ -1,2 +1,2 @@
+-old
++new
+ unchanged
+diff --git a/bar.rs b/bar.rs
+--- a/bar.rs
++++ b/bar.rs
+@@ -1,2 +1,3 @@
+ unchanged
++extra
+ unchanged"#;
+        let result = compact_diff(diff, 100);
+        assert!(result.contains("summary: 1 small changes"));
+        assert!(result.contains("summary: 2 small changes"));
+    }
+
+    #[test]
     fn test_compact_diff_increased_hunk_limit() {
         // Build a hunk with 25 changed lines — should NOT be truncated with limit 30
         let mut diff =
@@ -2600,6 +2666,19 @@ no changes added to commit (use "git add" and/or "git commit -a")
     }
 
     #[test]
+    fn test_filter_status_with_args_short_composite_status_no_double_count() {
+        let output = "## main\nRM src/lib.rs\nMM src/main.rs\n";
+        let result = filter_status_with_args(output);
+
+        assert!(result.contains("staged 2"), "Output was:\n{}", result);
+        assert!(
+            !result.contains("modified 2"),
+            "Composite statuses should not be double-counted in modified group:\n{}",
+            result
+        );
+    }
+
+    #[test]
     fn test_filter_log_output_multibyte() {
         // Thai characters: each is 3 bytes. A line with >80 bytes but few chars
         let thai_msg = format!("abc1234 {} (2 days ago) <author>", "ก".repeat(30));
@@ -2868,7 +2947,7 @@ no changes added to commit (use "git add" and/or "git commit -a")
 
     #[test]
     fn test_compact_diff_hunk_truncation_count_accurate() {
-        // 150 change lines in one hunk: 50 shown, 100 silently dropped
+        // 150 change lines in one hunk: 40 shown, 110 silently dropped
         // Must report the exact count, not just "(truncated)"
         let mut diff = String::from(
             "diff --git a/large.rs b/large.rs\n--- a/large.rs\n+++ b/large.rs\n@@ -1,150 +1,150 @@\n",
@@ -2878,8 +2957,8 @@ no changes added to commit (use "git add" and/or "git commit -a")
         }
         let result = compact_diff(&diff, 500);
         assert!(
-            result.contains("100 lines truncated"),
-            "Expected '100 lines truncated' (150 - 50 = 100), got:\n{}",
+            result.contains("110 lines truncated"),
+            "Expected '110 lines truncated' (150 - 40 = 110), got:\n{}",
             result
         );
     }

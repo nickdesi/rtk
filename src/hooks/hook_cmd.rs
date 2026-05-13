@@ -391,7 +391,12 @@ pub fn run_auto() -> Result<()> {
             );
             return Ok(());
         }
-        match get_rewritten(cmd) {
+        let config = crate::core::config::Config::load().unwrap_or_default();
+        match rewrite_command(
+            cmd,
+            &config.hooks.exclude_commands,
+            &config.hooks.transparent_prefixes,
+        ) {
             Some(ref rewritten) => {
                 audit_log("rewrite", cmd, rewritten);
                 print_rewrite(rewritten);
