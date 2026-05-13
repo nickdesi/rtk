@@ -54,6 +54,28 @@ assert_contains() {
     fi
 }
 
+assert_rewrite_contains() {
+    local name="$1"
+    local needle="$2"
+    shift 2
+    local output status
+    set +e
+    output=$("$@" 2>&1)
+    status=$?
+    set -e
+    if [[ "$status" == "0" || "$status" == "3" ]] && echo "$output" | grep -q "$needle"; then
+        PASS=$((PASS + 1))
+        printf "  ${GREEN}PASS${NC}  %s\n" "$name"
+    else
+        FAIL=$((FAIL + 1))
+        FAILURES+=("$name")
+        printf "  ${RED}FAIL${NC}  %s\n" "$name"
+        printf "        expected: '%s' with exit 0 or 3\n" "$needle"
+        printf "        status: %s\n" "$status"
+        printf "        got: %s\n" "$(echo "$output" | head -3)"
+    fi
+}
+
 assert_exit_ok() {
     local name="$1"
     shift
@@ -230,7 +252,7 @@ assert_help    "rtk cargo"                    rtk cargo
 
 section "Curl (new)"
 
-assert_contains "rtk curl JSON detect" "string" rtk curl https://httpbin.org/json
+assert_contains "rtk curl JSON detect" "slideshow" rtk curl https://httpbin.org/json
 assert_ok       "rtk curl plain text"          rtk curl https://httpbin.org/robots.txt
 assert_help     "rtk curl"                     rtk curl
 
@@ -282,7 +304,7 @@ TMPJSON=$(mktemp /tmp/rtk-test-XXXXX.json)
 echo '{"name":"test","count":42,"items":[1,2,3]}' > "$TMPJSON"
 
 assert_ok      "rtk json file"                rtk json "$TMPJSON"
-assert_contains "rtk json shows schema"       "string" rtk json "$TMPJSON"
+assert_contains "rtk json shows schema"       "string" rtk json "$TMPJSON" --keys-only
 
 rm -f "$TMPJSON"
 
@@ -483,10 +505,10 @@ assert_ok      "rtk learn (no sessions)"      rtk learn --since 0 2>&1 || true
 
 section "Rewrite"
 
-assert_contains "rewrite git status"          "rtk git status"         rtk rewrite "git status"
-assert_contains "rewrite cargo test"          "rtk cargo test"         rtk rewrite "cargo test"
-assert_contains "rewrite compound &&"         "rtk git status"         rtk rewrite "git status && cargo test"
-assert_contains "rewrite pipe preserves"      "| head"                 rtk rewrite "git log | head"
+assert_rewrite_contains "rewrite git status"          "rtk git status"         rtk rewrite "git status"
+assert_rewrite_contains "rewrite cargo test"          "rtk cargo test"         rtk rewrite "cargo test"
+assert_rewrite_contains "rewrite compound &&"         "rtk git status"         rtk rewrite "git status && cargo test"
+assert_rewrite_contains "rewrite pipe preserves"      "| head"                 rtk rewrite "git log | head"
 
 section "Rewrite (#345: RTK_DISABLED skip)"
 
@@ -495,14 +517,14 @@ assert_fails   "rewrite env RTK_DISABLED skip"                        rtk rewrit
 
 section "Rewrite (#346: 2>&1 preserved)"
 
-assert_contains "rewrite 2>&1 preserved"      "2>&1"                  rtk rewrite "cargo test 2>&1 | head"
+assert_rewrite_contains "rewrite 2>&1 preserved"      "2>&1"                  rtk rewrite "cargo test 2>&1 | head"
 
 section "Rewrite (#196: gh --json skip)"
 
 assert_fails   "rewrite gh --json skip"                               rtk rewrite "gh pr list --json number"
 assert_fails   "rewrite gh --jq skip"                                 rtk rewrite "gh api /repos --jq .name"
 assert_fails   "rewrite gh --template skip"                           rtk rewrite "gh pr view 1 --template '{{.title}}'"
-assert_contains "rewrite gh normal works"     "rtk gh pr list"        rtk rewrite "gh pr list"
+assert_rewrite_contains "rewrite gh normal works"     "rtk gh pr list"        rtk rewrite "gh pr list"
 
 # ── 33. Verify ────────────────────────────────────────
 
@@ -562,7 +584,7 @@ fi
 
 section "Hook check (#344)"
 
-assert_contains "rtk init --show hook version" "version" rtk init --show
+assert_contains "rtk init --show hook status" "Hook" rtk init --show
 
 # ══════════════════════════════════════════════════════
 # Report

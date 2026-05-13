@@ -108,7 +108,7 @@ pub fn exec(args: &[String], verbose: u8, skip_env: bool) -> Result<i32> {
 /// Builds the resolved command, appends args, applies `SKIP_ENV_VALIDATION`,
 /// emits the verbose log line, and routes through `runner::run_filtered` with
 /// the npm output filter.
-fn run_filtered(name: &str, args: &[String], verbose: u8, skip_env: bool) -> Result<i32> {
+pub fn run_filtered(name: &str, args: &[String], verbose: u8, skip_env: bool) -> Result<i32> {
     let mut cmd = resolved_command(name);
     for arg in args {
         cmd.arg(arg);
