@@ -400,10 +400,10 @@ pub fn run_auto() -> Result<()> {
             );
             return Ok(());
         }
-        let excluded = crate::core::config::Config::load()
-            .map(|c| c.hooks.exclude_commands)
-            .unwrap_or_default();
-        match rewrite_command(cmd, &excluded) {
+        let (excluded, transparent_prefixes) = crate::core::config::Config::load()
+            .map(|c| (c.hooks.exclude_commands, c.hooks.transparent_prefixes))
+            .unwrap_or_else(|_| (Vec::new(), Vec::new()));
+        match rewrite_command(cmd, &excluded, &transparent_prefixes) {
             Some(ref rewritten) => {
                 audit_log("rewrite", cmd, rewritten);
                 print_rewrite(rewritten);
