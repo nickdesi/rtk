@@ -210,9 +210,12 @@ fn run_pr(args: &[String], verbose: u8, ultra_compact: bool) -> Result<i32> {
         "status" => pr_status(&args[1..], verbose, ultra_compact),
         "create" => pr_create(&args[1..], verbose),
         "merge" => pr_merge(&args[1..], verbose),
-        "diff" => pr_diff(&args[1..], verbose),
+        "diff" => pr_diff(&args[1..], verbose, ultra_compact),
+        "close" => pr_action("closed", args, verbose),
         "comment" => pr_action("commented", args, verbose),
         "edit" => pr_action("edited", args, verbose),
+        "ready" => pr_action("marked-ready", args, verbose),
+        "reopen" => pr_action("reopened", args, verbose),
         _ => run_passthrough("gh", "pr", args),
     }
 }
@@ -564,6 +567,10 @@ fn run_issue(args: &[String], verbose: u8, ultra_compact: bool) -> Result<i32> {
     match args[0].as_str() {
         "list" => list_issues(&args[1..], verbose, ultra_compact),
         "view" => view_issue(&args[1..], verbose),
+        "close" => issue_action("closed", args, verbose),
+        "comment" => issue_action("commented", args, verbose),
+        "edit" => issue_action("edited", args, verbose),
+        "reopen" => issue_action("reopened", args, verbose),
         _ => run_passthrough("gh", "issue", args),
     }
 }
@@ -878,7 +885,15 @@ fn has_non_diff_format_flag(args: &[String]) -> bool {
     })
 }
 
-fn pr_diff(args: &[String], _verbose: u8) -> Result<i32> {
+fn diff_max_lines(ultra_compact: bool) -> usize {
+    if ultra_compact {
+        180
+    } else {
+        500
+    }
+}
+
+fn pr_diff(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<i32> {
     let no_compact = args.iter().any(|a| a == "--no-compact");
     let gh_args: Vec<String> = args
         .iter()
@@ -901,7 +916,7 @@ fn pr_diff(args: &[String], _verbose: u8) -> Result<i32> {
             if raw.trim().is_empty() {
                 "No diff".to_string()
             } else {
-                git::compact_diff(raw, 500)
+                git::compact_diff(raw, diff_max_lines(ultra_compact))
             }
         },
         RunOptions::stdout_only().early_exit_on_failure(),
@@ -910,10 +925,8 @@ fn pr_diff(args: &[String], _verbose: u8) -> Result<i32> {
 
 fn pr_action(action: &str, args: &[String], _verbose: u8) -> Result<i32> {
     let subcmd = &args[0];
-    let pr_num = args[1..]
-        .iter()
-        .find(|a| !a.starts_with('-'))
-        .map(|s| format!("#{}", s))
+    let pr_num = extract_identifier_and_extra_args(&args[1..])
+        .map(|(id, _)| format!("#{}", id))
         .unwrap_or_default();
     let mut cmd = resolved_command("gh");
     cmd.arg("pr");
@@ -926,6 +939,26 @@ fn pr_action(action: &str, args: &[String], _verbose: u8) -> Result<i32> {
         "gh",
         &format!("pr {}", subcmd),
         move |_stdout| ok_confirmation(&action, &pr_num),
+        RunOptions::stdout_only().early_exit_on_failure(),
+    )
+}
+
+fn issue_action(action: &str, args: &[String], _verbose: u8) -> Result<i32> {
+    let subcmd = &args[0];
+    let issue_num = extract_identifier_and_extra_args(&args[1..])
+        .map(|(id, _)| format!("#{}", id))
+        .unwrap_or_default();
+    let mut cmd = resolved_command("gh");
+    cmd.arg("issue");
+    for arg in args {
+        cmd.arg(arg);
+    }
+    let action = action.to_string();
+    runner::run_filtered(
+        cmd,
+        "gh",
+        &format!("issue {}", subcmd),
+        move |_stdout| ok_confirmation(&action, &issue_num),
         RunOptions::stdout_only().early_exit_on_failure(),
     )
 }
@@ -1007,6 +1040,18 @@ mod tests {
     }
 
     #[test]
+    fn test_ok_confirmation_pr_reopen() {
+        let result = ok_confirmation("reopened", "#42");
+        assert_eq!(result, "ok reopened #42");
+    }
+
+    #[test]
+    fn test_ok_confirmation_issue_close() {
+        let result = ok_confirmation("closed", "#99");
+        assert_eq!(result, "ok closed #99");
+    }
+
+    #[test]
     fn test_has_json_flag_present() {
         assert!(has_json_flag(&[
             "view".into(),
@@ -1044,6 +1089,14 @@ mod tests {
         let (id, extra) = extract_identifier_and_extra_args(&args).unwrap();
         assert_eq!(id, "185");
         assert_eq!(extra, vec!["-R", "rtk-ai/rtk"]);
+    }
+
+    #[test]
+    fn test_extract_identifier_skips_repo_value_for_pr_actions() {
+        let args: Vec<String> = vec!["-R".into(), "owner/repo".into(), "123".into()];
+        let (id, extra) = extract_identifier_and_extra_args(&args).unwrap();
+        assert_eq!(id, "123");
+        assert_eq!(extra, vec!["-R", "owner/repo"]);
     }
 
     #[test]
@@ -1306,6 +1359,16 @@ mod tests {
             "123".into(),
             "--color=always".into()
         ]));
+    }
+
+    #[test]
+    fn test_diff_max_lines_default() {
+        assert_eq!(diff_max_lines(false), 500);
+    }
+
+    #[test]
+    fn test_diff_max_lines_ultra_compact() {
+        assert_eq!(diff_max_lines(true), 180);
     }
 
     // --- filter_markdown_body tests ---

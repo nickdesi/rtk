@@ -115,6 +115,12 @@ pub struct CommandRecord {
 pub struct GainSummary {
     /// Total number of commands recorded
     pub total_commands: usize,
+    /// Commands that went through a filter path (including zero-savings fallbacks)
+    pub filtered_commands: usize,
+    /// Commands recorded as passthrough (0 input / 0 output)
+    pub passthrough_commands: usize,
+    /// Filtered commands that produced no savings
+    pub zero_savings_commands: usize,
     /// Total input tokens across all commands
     pub total_input: usize,
     /// Total output tokens across all commands
@@ -572,6 +578,9 @@ impl Tracker {
     pub fn get_summary_filtered(&self, project_path: Option<&str>) -> Result<GainSummary> {
         let (project_exact, project_glob) = project_filter_params(project_path); // added
         let mut total_commands = 0usize;
+        let mut filtered_commands = 0usize;
+        let mut passthrough_commands = 0usize;
+        let mut zero_savings_commands = 0usize;
         let mut total_input = 0usize;
         let mut total_output = 0usize;
         let mut total_saved = 0usize;
@@ -596,6 +605,14 @@ impl Tracker {
         for row in rows {
             let (input, output, saved, time_ms) = row?;
             total_commands += 1;
+            if input == 0 && output == 0 {
+                passthrough_commands += 1;
+            } else {
+                filtered_commands += 1;
+                if saved == 0 {
+                    zero_savings_commands += 1;
+                }
+            }
             total_input += input;
             total_output += output;
             total_saved += saved;
@@ -619,6 +636,9 @@ impl Tracker {
 
         Ok(GainSummary {
             total_commands,
+            filtered_commands,
+            passthrough_commands,
+            zero_savings_commands,
             total_input,
             total_output,
             total_saved,
@@ -1685,5 +1705,45 @@ mod tests {
             failures.total, 0,
             "parse_failures table should be empty after reset"
         );
+    }
+
+    #[test]
+    fn test_summary_tracks_filtered_vs_passthrough_coverage() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create in-memory tracker");
+        let pid = std::process::id();
+
+        tracker
+            .record(
+                "git diff",
+                &format!("rtk git diff coverage_test_{}", pid),
+                100,
+                20,
+                10,
+            )
+            .expect("Failed to record filtered command");
+        tracker
+            .record(
+                "gh pr view",
+                &format!("rtk gh pr view coverage_test_{}", pid),
+                50,
+                50,
+                5,
+            )
+            .expect("Failed to record zero-savings command");
+        tracker
+            .record(
+                "gh api",
+                &format!("rtk gh api passthrough_test_{}", pid),
+                0,
+                0,
+                2,
+            )
+            .expect("Failed to record passthrough command");
+
+        let summary = tracker.get_summary().expect("Failed to get summary");
+        assert_eq!(summary.total_commands, 3);
+        assert_eq!(summary.filtered_commands, 2);
+        assert_eq!(summary.passthrough_commands, 1);
+        assert_eq!(summary.zero_savings_commands, 1);
     }
 }

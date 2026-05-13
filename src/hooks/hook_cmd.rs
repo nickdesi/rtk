@@ -415,7 +415,11 @@ pub fn run_auto() -> Result<()> {
 
     // 3. Everything else → Claude Code format (also accepted by VS Code Copilot Chat)
     match process_claude_payload(&v) {
-        PayloadAction::Rewrite { cmd, rewritten, output } => {
+        PayloadAction::Rewrite {
+            cmd,
+            rewritten,
+            output,
+        } => {
             audit_log("rewrite", &cmd, &rewritten);
             let _ = writeln!(io::stdout(), "{output}");
         }

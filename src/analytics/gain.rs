@@ -117,7 +117,37 @@ pub fn run(
                 format_duration(summary.avg_time_ms)
             ),
         );
+        let coverage_pct = if summary.total_commands > 0 {
+            (summary.filtered_commands as f64 / summary.total_commands as f64) * 100.0
+        } else {
+            0.0
+        };
+        let saving_commands = summary
+            .filtered_commands
+            .saturating_sub(summary.zero_savings_commands);
+        let saving_pct = if summary.total_commands > 0 {
+            (saving_commands as f64 / summary.total_commands as f64) * 100.0
+        } else {
+            0.0
+        };
+        print_kpi(
+            "Filter attempts",
+            format!(
+                "{}/{} ({:.1}%)",
+                summary.filtered_commands, summary.total_commands, coverage_pct
+            ),
+        );
+        print_kpi(
+            "Saving filters",
+            format!(
+                "{}/{} ({:.1}%)",
+                saving_commands, summary.total_commands, saving_pct
+            ),
+        );
+        print_kpi("Passthrough", summary.passthrough_commands.to_string());
+        print_kpi("Zero-savings", summary.zero_savings_commands.to_string());
         print_efficiency_meter(summary.avg_savings_pct);
+        println!("Note: token counts use an estimate of ~4 chars/token.");
         println!();
 
         // Warn about hook issues that silently kill savings (stderr, not stdout)
