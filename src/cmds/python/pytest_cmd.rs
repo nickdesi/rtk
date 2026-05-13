@@ -159,7 +159,7 @@ fn build_pytest_summary(summary: &str, _test_files: &[String], failures: &[Strin
         result.push_str(&format!(", {} skipped", skipped));
     }
     result.push('\n');
-    result.push_str("═══════════════════════════════════════\n");
+    result.push_str("──\n");
 
     if failures.is_empty() {
         return result.trim().to_string();

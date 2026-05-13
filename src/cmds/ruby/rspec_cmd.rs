@@ -210,7 +210,7 @@ fn build_rspec_summary(rspec: &RspecOutput) -> String {
         result.push_str(&format!(", {} pending", s.pending_count));
     }
     result.push_str(&format!(" ({:.2}s)\n", s.duration));
-    result.push_str("═══════════════════════════════════════\n");
+    result.push_str("──\n");
 
     let failures: Vec<&RspecExample> = rspec
         .examples
@@ -346,7 +346,7 @@ fn filter_rspec_text(output: &str) -> String {
             return format!("RSpec: {}", summary_line);
         }
         let mut result = format!("RSpec: {}\n", summary_line);
-        result.push_str("═══════════════════════════════════════\n\n");
+        result.push_str("──\n\n");
         for (i, failure) in failures.iter().take(5).enumerate() {
             result.push_str(&format!("{}. ❌ {}\n", i + 1, failure));
             if i < failures.len().min(5) - 1 {

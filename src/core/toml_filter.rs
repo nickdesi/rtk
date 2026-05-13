@@ -106,6 +106,13 @@ struct TomlFilterDef {
     /// Use for tools like liquibase that emit banners/logs to stderr.
     #[serde(default)]
     filter_stderr: bool,
+    /// Deduplicate consecutive identical lines, replacing repeats with count suffix.
+    /// e.g. 3 identical "ERROR: timeout" lines → "ERROR: timeout (x3)"
+    #[serde(default)]
+    dedup_lines: bool,
+    /// Collapse multiple spaces to single space and strip blank lines.
+    #[serde(default)]
+    compact_whitespace: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +158,8 @@ pub struct CompiledFilter {
     on_empty: Option<String>,
     /// When true, the runner should capture stderr and merge it with stdout.
     pub filter_stderr: bool,
+    pub dedup_lines: bool,
+    pub compact_whitespace: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +417,8 @@ fn compile_filter(name: String, def: TomlFilterDef) -> Result<CompiledFilter, St
         max_lines: def.max_lines,
         on_empty: def.on_empty,
         filter_stderr: def.filter_stderr,
+        dedup_lines: def.dedup_lines,
+        compact_whitespace: def.compact_whitespace,
     })
 }
 
@@ -442,7 +453,9 @@ pub fn find_filter_in<'a>(
 ///   5. truncate_lines_at    — truncate each line to N chars
 ///   6. head/tail_lines      — keep first/last N lines
 ///   7. max_lines            — absolute line cap
-///   8. on_empty             — message if result is empty
+///   8. dedup_lines          — collapse consecutive identical lines (N → 1 + count)
+///   9. compact_whitespace   — trim lines, collapse spaces, remove blank lines
+///  10. on_empty             — message if result is empty
 pub fn apply_filter(filter: &CompiledFilter, stdout: &str) -> String {
     let mut lines: Vec<String> = stdout.lines().map(String::from).collect();
 
@@ -532,7 +545,17 @@ pub fn apply_filter(filter: &CompiledFilter, stdout: &str) -> String {
         }
     }
 
-    // 8. on_empty
+    // 8. dedup_lines — collapse consecutive identical lines into single line with count
+    if filter.dedup_lines {
+        lines = dedup_consecutive_lines(&lines);
+    }
+
+    // 9. compact_whitespace — collapse spaces, strip blank lines
+    if filter.compact_whitespace {
+        lines = compact_lines(&lines);
+    }
+
+    // 10. on_empty
     let result = lines.join("\n");
     if result.trim().is_empty() {
         if let Some(ref msg) = filter.on_empty {
@@ -541,6 +564,51 @@ pub fn apply_filter(filter: &CompiledFilter, stdout: &str) -> String {
     }
 
     result
+}
+
+/// Collapse consecutive identical lines: N repeats → single line + (xN).
+/// Non-consecutive duplicates are preserved (different context).
+fn dedup_consecutive_lines(lines: &[String]) -> Vec<String> {
+    if lines.is_empty() {
+        return vec![];
+    }
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut current = &lines[0];
+    let mut count: usize = 1;
+    for line in &lines[1..] {
+        if line == current {
+            count += 1;
+        } else {
+            if count > 1 {
+                out.push(format!("{} (x{})", current, count));
+            } else {
+                out.push(current.clone());
+            }
+            current = line;
+            count = 1;
+        }
+    }
+    if count > 1 {
+        out.push(format!("{} (x{})", current, count));
+    } else {
+        out.push(current.clone());
+    }
+    out
+}
+
+/// Compact whitespace: trim each line, collapse 2+ spaces to 1, remove purely blank lines.
+fn compact_lines(lines: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Collapse multiple spaces into single space
+        let compacted: String = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+        out.push(compacted);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1703,5 +1771,65 @@ expected = "output line 1\noutput line 2"
             "Newly added filter must be discoverable via find_filter_in"
         );
         assert_eq!(found.unwrap().name, "my-new-tool");
+    }
+
+    // ── dedup_consecutive_lines ──
+
+    #[test]
+    fn test_dedup_no_dupes() {
+        let lines: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+        let result = dedup_consecutive_lines(&lines);
+        assert_eq!(result, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_dedup_consecutive_dupes() {
+        let lines: Vec<String> = vec!["a".into(), "a".into(), "a".into(), "b".into(), "c".into()];
+        let result = dedup_consecutive_lines(&lines);
+        assert_eq!(result, vec!["a (x3)", "b", "c"]);
+    }
+
+    #[test]
+    fn test_dedup_mixed() {
+        let lines: Vec<String> = vec!["error".into(), "error".into(), "ok".into(), "error".into()];
+        let result = dedup_consecutive_lines(&lines);
+        assert_eq!(result, vec!["error (x2)", "ok", "error"]);
+    }
+
+    #[test]
+    fn test_dedup_empty() {
+        let lines: Vec<String> = vec![];
+        let result = dedup_consecutive_lines(&lines);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_dedup_single() {
+        let lines: Vec<String> = vec!["only".into()];
+        let result = dedup_consecutive_lines(&lines);
+        assert_eq!(result, vec!["only"]);
+    }
+
+    // ── compact_lines ──
+
+    #[test]
+    fn test_compact_removes_blank_lines() {
+        let lines: Vec<String> = vec!["a".into(), "".into(), "  ".into(), "b".into()];
+        let result = compact_lines(&lines);
+        assert_eq!(result, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_compact_collapses_spaces() {
+        let lines: Vec<String> = vec!["hello    world".into(), "  foo   bar  ".into()];
+        let result = compact_lines(&lines);
+        assert_eq!(result, vec!["hello world", "foo bar"]);
+    }
+
+    #[test]
+    fn test_compact_all_blank() {
+        let lines: Vec<String> = vec!["".into(), "   ".into(), "\t".into()];
+        let result = compact_lines(&lines);
+        assert!(result.is_empty());
     }
 }

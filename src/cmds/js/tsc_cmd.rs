@@ -85,7 +85,7 @@ impl BlockHandler for TscHandler {
         }
 
         let mut result = format!(
-            "═══════════════════════════════════════\nTypeScript: {} errors in {} files\n",
+            "──\nTypeScript: {} errors in {} files\n",
             self.error_count,
             self.files.len()
         );
@@ -176,7 +176,7 @@ pub(crate) fn filter_tsc_output(output: &str) -> String {
         errors.len(),
         by_file.len()
     ));
-    result.push_str("═══════════════════════════════════════\n");
+    result.push_str("──\n");
 
     // Top error codes summary (compact, one line)
     let mut code_counts: Vec<_> = by_code.iter().collect();

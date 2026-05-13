@@ -434,7 +434,7 @@ pub(crate) fn filter_go_test_json(output: &str) -> String {
         result.push_str(&format!(", {} skipped", total_skip));
     }
     result.push_str(&format!(" in {} packages\n", total_packages));
-    result.push_str("═══════════════════════════════════════\n");
+    result.push_str("──\n");
 
     // Show package-level failures first (timeouts, signals, panics).
     // Skip packages that already have individual test-level failures — those are displayed
@@ -589,7 +589,7 @@ pub(crate) fn filter_go_build(output: &str) -> String {
 
     let mut result = String::new();
     result.push_str(&format!("Go build: {} errors\n", errors.len()));
-    result.push_str("═══════════════════════════════════════\n");
+    result.push_str("──\n");
 
     for (i, error) in errors.iter().take(20).enumerate() {
         result.push_str(&format!("{}. {}\n", i + 1, truncate(error, 120)));
@@ -678,7 +678,7 @@ fn filter_go_vet(output: &str) -> String {
 
     let mut result = String::new();
     result.push_str(&format!("Go vet: {} issues\n", issues.len()));
-    result.push_str("═══════════════════════════════════════\n");
+    result.push_str("──\n");
 
     for (i, issue) in issues.iter().take(20).enumerate() {
         result.push_str(&format!("{}. {}\n", i + 1, truncate(issue, 120)));

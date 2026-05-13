@@ -637,8 +637,7 @@ pub(crate) fn filter_log_output(
             .map(|l| l.trim())
             .filter(|l| {
                 !l.is_empty()
-                    && !l.starts_with("Signed-off-by:")
-                    && !l.starts_with("Co-authored-by:")
+                    && !is_trailer_line(l)
             })
             .collect();
         let body_omitted = all_body_lines.len().saturating_sub(3);
@@ -659,6 +658,35 @@ pub(crate) fn filter_log_output(
     }
 
     result.join("\n").trim().to_string()
+}
+
+/// Check if a line is a Git trailer (Signed-off-by, Co-authored-by, etc.).
+/// These are metadata, not body content, and can be safely stripped.
+fn is_trailer_line(line: &str) -> bool {
+    let known_trailers = [
+        "Signed-off-by:",
+        "Co-authored-by:",
+        "Reviewed-by:",
+        "Acked-by:",
+        "Tested-by:",
+        "Reported-by:",
+        "Suggested-by:",
+        "Helped-by:",
+        "Merged-by:",
+        "Approved-by:",
+        "PR-URL:",
+        "Bug:",
+        "Closes:",
+        "Fixes:",
+        "Refs:",
+        "See-also:",
+        "Change-Id:",
+        "CRs-fixed:",
+        "Ticket:",
+    ];
+    known_trailers
+        .iter()
+        .any(|t| line.starts_with(t) || line.starts_with(&t.to_lowercase()))
 }
 
 /// Truncate a single line to `width` characters, appending "..." if needed

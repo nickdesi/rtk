@@ -440,7 +440,7 @@ fn display_summary(tracker: &Tracker, verbose: u8) -> Result<()> {
     let totals = compute_totals(&periods);
 
     println!("[cost] Claude Code Economics");
-    println!("════════════════════════════════════════════════════");
+    println!("──");
     println!();
 
     println!(
@@ -548,7 +548,7 @@ fn display_daily(tracker: &Tracker, verbose: u8) -> Result<()> {
     let periods = merge_daily(cc_daily, rtk_daily);
 
     println!("Daily Economics");
-    println!("════════════════════════════════════════════════════");
+    println!("──");
     print_period_table(&periods, verbose);
     Ok(())
 }
@@ -562,7 +562,7 @@ fn display_weekly(tracker: &Tracker, verbose: u8) -> Result<()> {
     let periods = merge_weekly(cc_weekly, rtk_weekly);
 
     println!("Weekly Economics");
-    println!("════════════════════════════════════════════════════");
+    println!("──");
     print_period_table(&periods, verbose);
     Ok(())
 }
@@ -576,7 +576,7 @@ fn display_monthly(tracker: &Tracker, verbose: u8) -> Result<()> {
     let periods = merge_monthly(cc_monthly, rtk_monthly);
 
     println!("Monthly Economics");
-    println!("════════════════════════════════════════════════════");
+    println!("──");
     print_period_table(&periods, verbose);
     Ok(())
 }
