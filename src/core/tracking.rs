@@ -43,7 +43,6 @@ use std::time::Instant;
 fn current_project_path_string() -> String {
     std::env::current_dir()
         .ok()
-        .and_then(|p| p.canonicalize().ok())
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default()
 }
@@ -91,6 +90,8 @@ use super::constants::{DEFAULT_HISTORY_DAYS, HISTORY_DB, RTK_DATA_DIR};
 pub struct Tracker {
     conn: Connection,
 }
+
+const SCHEMA_VERSION: i64 = 1;
 
 /// Individual command record from tracking history.
 ///
@@ -259,13 +260,35 @@ impl Tracker {
         }
 
         let conn = Connection::open(&db_path)?;
-        // WAL mode + busy_timeout for concurrent access (multiple Claude Code instances).
-        // Non-fatal: NFS/read-only filesystems may not support WAL.
-        let _ = conn.execute_batch(
+        let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+        let tracker = Self { conn };
+
+        let schema_version: i64 = tracker
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0);
+        if schema_version != SCHEMA_VERSION {
+            tracker.init_schema()?;
+        }
+
+        Ok(tracker)
+    }
+
+    /// Create an isolated in-memory tracker for tests.
+    #[cfg(test)]
+    pub fn new_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory().context("Failed to open in-memory DB")?;
+        let tracker = Self { conn };
+        tracker.init_schema()?;
+        Ok(tracker)
+    }
+
+    fn init_schema(&self) -> Result<()> {
+        let _ = self.conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA busy_timeout=5000;",
         );
-        conn.execute(
+        self.conn.execute(
             "CREATE TABLE IF NOT EXISTS commands (
                 id INTEGER PRIMARY KEY,
                 timestamp TEXT NOT NULL,
@@ -278,24 +301,21 @@ impl Tracker {
             )",
             [],
         )?;
-
-        conn.execute(
+        self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_timestamp ON commands(timestamp)",
             [],
         )?;
 
-        // Migration: add exec_time_ms column if it doesn't exist
-        let _ = conn.execute(
+        let _ = self.conn.execute(
             "ALTER TABLE commands ADD COLUMN exec_time_ms INTEGER DEFAULT 0",
             [],
         );
-        // Migration: add project_path column with DEFAULT '' for new rows // changed: added DEFAULT
-        let _ = conn.execute(
+        let _ = self.conn.execute(
             "ALTER TABLE commands ADD COLUMN project_path TEXT DEFAULT ''",
             [],
         );
-        // One-time migration: normalize NULLs from pre-default schema // changed: guarded with EXISTS
-        let has_nulls: bool = conn
+        let has_nulls: bool = self
+            .conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM commands WHERE project_path IS NULL)",
                 [],
@@ -303,69 +323,16 @@ impl Tracker {
             )
             .unwrap_or(false);
         if has_nulls {
-            let _ = conn.execute(
+            let _ = self.conn.execute(
                 "UPDATE commands SET project_path = '' WHERE project_path IS NULL",
                 [],
             );
         }
-        // Index for fast project-scoped gain queries // added
-        let _ = conn.execute(
+        let _ = self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_project_path_timestamp ON commands(project_path, timestamp)",
             [],
         );
 
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS parse_failures (
-                id INTEGER PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                raw_command TEXT NOT NULL,
-                error_message TEXT NOT NULL,
-                fallback_succeeded INTEGER NOT NULL DEFAULT 0
-            )",
-            [],
-        )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_pf_timestamp ON parse_failures(timestamp)",
-            [],
-        )?;
-
-        Ok(Self { conn })
-    }
-
-    /// Create an isolated in-memory tracker for tests.
-    #[cfg(test)]
-    pub fn new_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory().context("Failed to open in-memory DB")?;
-        let tracker = Self { conn };
-        tracker.init_schema()?;
-        Ok(tracker)
-    }
-
-    #[cfg(test)]
-    fn init_schema(&self) -> Result<()> {
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS commands (
-                id INTEGER PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                original_cmd TEXT NOT NULL,
-                rtk_cmd TEXT NOT NULL,
-                input_tokens INTEGER NOT NULL,
-                output_tokens INTEGER NOT NULL,
-                saved_tokens INTEGER NOT NULL,
-                savings_pct REAL NOT NULL,
-                exec_time_ms INTEGER DEFAULT 0,
-                project_path TEXT DEFAULT ''
-            )",
-            [],
-        )?;
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_timestamp ON commands(timestamp)",
-            [],
-        )?;
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_project_path_timestamp ON commands(project_path, timestamp)",
-            [],
-        )?;
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS parse_failures (
                 id INTEGER PRIMARY KEY,
@@ -380,6 +347,8 @@ impl Tracker {
             "CREATE INDEX IF NOT EXISTS idx_pf_timestamp ON parse_failures(timestamp)",
             [],
         )?;
+        self.conn
+            .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -1302,8 +1271,8 @@ pub fn record_parse_failure_silent(raw_command: &str, error_message: &str, succe
 /// assert_eq!(estimate_tokens("hello world"), 3); // 11 chars = ceil(2.75) = 3
 /// ```
 pub fn estimate_tokens(text: &str) -> usize {
-    // ~4 chars per token on average
-    (text.len() as f64 / 4.0).ceil() as usize
+    // ~4 chars per token on average, rounded up.
+    text.len().div_ceil(4)
 }
 
 /// Helper struct for timing command execution

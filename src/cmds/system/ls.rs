@@ -2,21 +2,11 @@
 
 use super::constants::NOISE_DIRS;
 use crate::core::runner::{self, RunOptions};
+use crate::core::tracking::TimedExecution;
 use crate::core::utils::resolved_command;
 use anyhow::Result;
-use lazy_static::lazy_static;
-use regex::Regex;
 use std::io::IsTerminal;
-
-lazy_static! {
-    /// Matches the date+time portion in `ls -la` output, which serves as a
-    /// stable anchor regardless of owner/group column width.
-    /// E.g.: " Mar 31 16:18 " or " Dec 25  2024 "
-    static ref LS_DATE_RE: Regex = Regex::new(
-        r"\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+(?:\d{4}|\d{2}:\d{2})\s+"
-    )
-    .unwrap();
-}
+use std::path::Path;
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     let show_all = args
@@ -68,12 +58,30 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         paths.join(" ")
     };
 
+    if flags.is_empty() || flags.iter().all(|f| matches!(*f, "-a" | "--all")) {
+        if let Some(filtered) = native_ls(&paths, show_all, std::io::stdout().is_terminal()) {
+            if verbose > 0 {
+                eprintln!("Chars: native → {}", filtered.len());
+            }
+            let timer = TimedExecution::start();
+            print!("{}", filtered);
+            timer.track(
+                &format!("ls -la {}", target_display),
+                &format!("rtk ls {}", target_display),
+                &filtered,
+                &filtered,
+            );
+            return Ok(0);
+        }
+    }
+
     runner::run_filtered(
         cmd,
         "ls",
         &format!("-la {}", target_display),
         |raw| {
-            let (entries, summary, parsed_count) = compact_ls(raw, show_all);
+            let include_summary = std::io::stdout().is_terminal();
+            let (entries, summary, parsed_count) = compact_ls_with_options(raw, show_all, include_summary);
 
             // If no lines were parsed (e.g., unrecognized locale), fall back to raw output.
             // This is safer than returning "(empty)" for a non-empty directory.
@@ -85,8 +93,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
             }
 
             // Only show summary in interactive mode (not when piped)
-            let is_tty = std::io::stdout().is_terminal();
-            let filtered = if is_tty {
+            let filtered = if include_summary {
                 format!("{}{}", entries, summary)
             } else {
                 entries
@@ -126,40 +133,156 @@ fn human_size(bytes: u64) -> String {
 /// Parse a single `ls -la` line, returning `(file_type_char, size, name)`.
 ///
 /// Uses the date field as a stable anchor — the date format in `ls -la` is
-/// always three tokens (`Mon DD HH:MM` or `Mon DD  YYYY`), so we locate it
-/// with a regex, then extract size (rightmost number before the date) and
-/// filename (everything after the date). This handles owner/group names that
-/// contain spaces, which break the old fixed-column approach.
+/// always three tokens (`Mon DD HH:MM` or `Mon DD  YYYY`), so we locate it,
+/// then extract size (rightmost number before the date) and filename
+/// (everything after the date). This handles owner/group names that contain
+/// spaces, which break fixed-column parsing.
 fn parse_ls_line(line: &str) -> Option<(char, u64, String)> {
     // Skip . and .. entries before date parsing (works for non-English locales too)
     if is_dotdir(line) {
         return None;
     }
 
-    let date_match = LS_DATE_RE.find(line)?;
-    let name = line[date_match.end()..].to_string();
+    let mut fields: Vec<(usize, usize, &str)> = Vec::with_capacity(10);
+    let mut in_token = false;
+    let mut token_start = 0;
+    for (idx, ch) in line.char_indices() {
+        if ch.is_whitespace() {
+            if in_token {
+                fields.push((token_start, idx, &line[token_start..idx]));
+                in_token = false;
+            }
+        } else if !in_token {
+            token_start = idx;
+            in_token = true;
+        }
+    }
+    if in_token {
+        fields.push((token_start, line.len(), &line[token_start..]));
+    }
 
-    let before_date = &line[..date_match.start()];
-    let before_parts: Vec<&str> = before_date.split_whitespace().collect();
-    if before_parts.len() < 4 {
+    let perms = fields.first()?.2;
+    let file_type = perms.as_bytes().first().copied()? as char;
+
+    let mut tokens = line.match_indices(char::is_whitespace).peekable();
+    let mut start = line
+        .char_indices()
+        .find(|(_, c)| !c.is_whitespace())
+        .map(|(idx, _)| idx)?;
+
+    while start < line.len() {
+        let end = match tokens.find(|(idx, _)| *idx >= start) {
+            Some((idx, _)) => idx,
+            None => line.len(),
+        };
+        fields.push((start, end, &line[start..end]));
+        if end == line.len() {
+            break;
+        }
+        start = line[end..]
+            .char_indices()
+            .find(|(_, c)| !c.is_whitespace())
+            .map(|(idx, _)| end + idx)?;
+    }
+
+    let date_idx = fields.windows(3).position(|w| {
+        is_month(w[0].2)
+            && w[1].2.parse::<u8>().is_ok_and(|day| (1..=31).contains(&day))
+            && is_ls_time_or_year(w[2].2)
+    })?;
+
+    let size = fields[..date_idx]
+        .iter()
+        .rev()
+        .find_map(|(_, _, part)| part.parse::<u64>().ok())?;
+    let name_start = fields.get(date_idx + 2)?.1;
+    let name = line[name_start..].trim_start().to_string();
+    if name.is_empty() {
         return None;
     }
 
-    let perms = before_parts[0];
-    let file_type = perms.chars().next()?;
+    Some((file_type, size, name))
+}
 
-    // Size is the rightmost parseable number before the date.
-    // nlinks is also numeric but appears earlier; scanning from the end
-    // guarantees we hit the size field first.
-    let mut size: u64 = 0;
-    for part in before_parts.iter().rev() {
-        if let Ok(s) = part.parse::<u64>() {
-            size = s;
-            break;
-        }
+fn is_month(token: &str) -> bool {
+    matches!(
+        token,
+        "Jan" | "Feb" | "Mar" | "Apr" | "May" | "Jun" | "Jul" | "Aug" | "Sep" | "Oct" | "Nov" | "Dec"
+    )
+}
+
+fn is_ls_time_or_year(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    (bytes.len() == 5
+        && bytes[2] == b':'
+        && bytes[..2].iter().all(u8::is_ascii_digit)
+        && bytes[3..].iter().all(u8::is_ascii_digit))
+        || (bytes.len() == 4 && bytes.iter().all(u8::is_ascii_digit))
+}
+
+fn native_ls(paths: &[&str], show_all: bool, include_summary: bool) -> Option<String> {
+    let targets: Vec<&str> = if paths.is_empty() { vec!["."] } else { paths.to_vec() };
+    if targets.len() != 1 {
+        return None;
     }
 
-    Some((file_type, size, name))
+    let path = Path::new(targets[0]);
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.is_dir() {
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(path).ok()? {
+            let entry = entry.ok()?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !show_all && NOISE_DIRS.iter().any(|noise| name == *noise) {
+                continue;
+            }
+            let metadata = entry.metadata().ok()?;
+            if metadata.is_dir() {
+                dirs.push(name);
+            } else {
+                files.push((name, metadata.len()));
+            }
+        }
+        dirs.sort_unstable();
+        files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        return Some(format_native_entries(dirs, files, include_summary));
+    }
+
+    let name = path.file_name()?.to_string_lossy().to_string();
+    Some(format_native_entries(
+        Vec::new(),
+        vec![(name, metadata.len())],
+        include_summary,
+    ))
+}
+
+fn format_native_entries(
+    dirs: Vec<String>,
+    files: Vec<(String, u64)>,
+    include_summary: bool,
+) -> String {
+    if dirs.is_empty() && files.is_empty() {
+        return "(empty)\n".to_string();
+    }
+
+    let mut entries = String::new();
+    for dir in &dirs {
+        entries.push_str(dir);
+        entries.push_str("/\n");
+    }
+    for (name, size) in &files {
+        entries.push_str(name);
+        entries.push_str("  ");
+        entries.push_str(&human_size(*size));
+        entries.push('\n');
+    }
+
+    if include_summary {
+        entries.push_str(&format!("\nSummary: {} files, {} dirs\n", files.len(), dirs.len()));
+    }
+
+    entries
 }
 
 /// Returns true if the line represents a . or .. directory entry.
@@ -169,7 +292,8 @@ fn parse_ls_line(line: &str) -> Option<(char, u64, String)> {
 /// always appear in `ls -la` output and are skipped during parsing since they
 /// carry no meaningful content for token reduction.
 fn is_dotdir(line: &str) -> bool {
-    line.trim().ends_with('.') || line.trim().ends_with("..")
+    let trimmed = line.trim();
+    trimmed.ends_with('.') || trimmed.ends_with("..")
 }
 
 /// Parse ls -la output into compact format:
@@ -178,7 +302,16 @@ fn is_dotdir(line: &str) -> bool {
 /// Returns (entries, summary, parsed_count) so caller can suppress summary when piped.
 /// parsed_count tracks how many non-header lines were successfully parsed.
 /// If parsed_count == 0 but raw had content, caller should fall back to raw output.
+#[cfg(test)]
 fn compact_ls(raw: &str, show_all: bool) -> (String, String, usize) {
+    compact_ls_with_options(raw, show_all, true)
+}
+
+fn compact_ls_with_options(
+    raw: &str,
+    show_all: bool,
+    include_summary: bool,
+) -> (String, String, usize) {
     use std::collections::HashMap;
 
     let mut dirs: Vec<String> = Vec::new();
@@ -211,12 +344,14 @@ fn compact_ls(raw: &str, show_all: bool) -> (String, String, usize) {
             dirs.push(name);
         } else {
             // Regular files, symlinks, character/block devices, pipes, sockets
-            let ext = if let Some(pos) = name.rfind('.') {
-                name[pos..].to_string()
-            } else {
-                "no ext".to_string()
-            };
-            *by_ext.entry(ext).or_insert(0) += 1;
+            if include_summary {
+                let ext = if let Some(pos) = name.rfind('.') {
+                    name[pos..].to_string()
+                } else {
+                    "no ext".to_string()
+                };
+                *by_ext.entry(ext).or_insert(0) += 1;
+            }
             files.push((name, human_size(size)));
         }
     }
@@ -247,6 +382,10 @@ fn compact_ls(raw: &str, show_all: bool) -> (String, String, usize) {
         entries.push_str("  ");
         entries.push_str(size);
         entries.push('\n');
+    }
+
+    if !include_summary {
+        return (entries, String::new(), parsed_count);
     }
 
     // Summary line (separate so caller can suppress when piped)
